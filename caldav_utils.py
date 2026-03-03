@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Purge or deduplicate events in a CalDAV calendar."""
+"""Purge, deduplicate, or make public events in a CalDAV calendar."""
 
 import argparse
 import getpass
@@ -7,6 +7,8 @@ import logging
 import os
 import sys
 from collections import defaultdict
+
+import uuid
 
 import caldav
 from caldav.lib.error import AuthorizationError
@@ -169,20 +171,23 @@ def format_key(key):
 
 
 def select_mode(args):
-    """Return 'purge' or 'dedup' from args or interactive prompt."""
+    """Return 'purge', 'dedup', or 'make-public' from args or interactive prompt."""
     if args.mode:
         return args.mode
 
     print("\nAction:")
     print("  1. Deduplicate (remove duplicate events)")
     print("  2. Purge (delete ALL events)")
+    print("  3. Make public (set all events to PUBLIC)")
     while True:
-        choice = input("Select action [1-2]: ").strip()
+        choice = input("Select action [1-3]: ").strip()
         if choice == "1":
             return "dedup"
         if choice == "2":
             return "purge"
-        print("  Please enter 1 or 2.")
+        if choice == "3":
+            return "make-public"
+        print("  Please enter 1, 2, or 3.")
 
 
 def run_purge(events, calendar, args):
@@ -217,7 +222,8 @@ def run_purge(events, calendar, args):
             deleted += 1
         except Exception as e:
             errors += 1
-            print(f"  Error deleting '{summary}': {e}", file=sys.stderr)
+            print(f"  Error deleting '{summary}': {type(e).__name__}: {e}", file=sys.stderr)
+            print(f"    URL: {event.url}", file=sys.stderr)
         if i % 10 == 0 or i == count:
             print(f"  Progress: {i}/{count}")
 
@@ -267,12 +273,104 @@ def run_dedup(events, calendar, args):
                 deleted += 1
             except Exception as e:
                 errors += 1
-                print(f"  Error deleting '{summary}': {e}", file=sys.stderr)
+                print(f"  Error deleting '{summary}': {type(e).__name__}: {e}", file=sys.stderr)
+                print(f"    URL: {event.url}", file=sys.stderr)
             processed += 1
             if processed % 10 == 0 or processed == total_dupes:
                 print(f"  Progress: {processed}/{total_dupes}")
 
     print(f"\nDone. Deleted: {deleted}, Errors: {errors}")
+    if errors:
+        sys.exit(1)
+
+
+def run_make_public(events, calendar, args):
+    """Set CLASS to PUBLIC on all non-public events in the calendar."""
+    non_public = []
+    for event in events:
+        try:
+            cal = event.icalendar_instance
+            for component in cal.walk():
+                if component.name == "VEVENT":
+                    cls = component.get("CLASS")
+                    if cls and str(cls).upper() in ("PRIVATE", "CONFIDENTIAL"):
+                        non_public.append((event, component, str(cls)))
+                    break
+        except Exception:
+            pass
+
+    if not non_public:
+        print("No non-public events found.")
+        return
+
+    print(f"\nFound {len(non_public)} non-public event(s):\n")
+    for event, component, cls in non_public:
+        summary = str(component.get("SUMMARY", "(no summary)"))
+        print(f"  - [{cls}] {summary}")
+
+    if args.dry_run:
+        print(f"\nDry run — {len(non_public)} event(s) would be set to PUBLIC.")
+        return
+
+    if not args.yes:
+        print(f"\nThis will set {len(non_public)} event(s) to PUBLIC in '{calendar.name}'.")
+        answer = input("Confirm? [y/N]: ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return
+
+    print(f"\nSetting {len(non_public)} event(s) to PUBLIC ...")
+    modified = 0
+    recreated = 0
+    errors = 0
+    forbidden = []
+    for i, (event, component, cls) in enumerate(non_public, 1):
+        summary = str(component.get("SUMMARY", "(no summary)"))
+        try:
+            component["CLASS"] = "PUBLIC"
+            event.save()
+            modified += 1
+        except AuthorizationError:
+            forbidden.append((event, component, cls, summary))
+            print(f"  Forbidden: '{summary}' (will ask about re-creation)")
+        except Exception as e:
+            errors += 1
+            print(f"  Error modifying '{summary}': {type(e).__name__}: {e}", file=sys.stderr)
+            print(f"    URL: {event.url}", file=sys.stderr)
+            print(f"    CLASS: {cls}", file=sys.stderr)
+        if i % 10 == 0 or i == len(non_public):
+            print(f"  Progress: {i}/{len(non_public)}")
+
+    if forbidden:
+        print(f"\n{len(forbidden)} event(s) could not be modified (Forbidden).")
+        print("You can delete and re-create them as PUBLIC (you will become the organizer).\n")
+        for event, component, cls, summary in forbidden:
+            answer = input(f"  Delete and re-create '{summary}' as PUBLIC? [y/N]: ").strip().lower()
+            if answer not in ("y", "yes"):
+                print(f"    Skipped.")
+                errors += 1
+                continue
+            try:
+                # Prepare new iCalendar data with CLASS=PUBLIC and a new UID
+                cal = event.icalendar_instance
+                for comp in cal.walk():
+                    if comp.name == "VEVENT":
+                        comp["CLASS"] = "PUBLIC"
+                        comp["UID"] = str(uuid.uuid4())
+                        # Remove ORGANIZER so the calendar owner becomes the implicit organizer
+                        if "ORGANIZER" in comp:
+                            del comp["ORGANIZER"]
+                new_ical = cal.to_ical().decode("utf-8")
+                # Save new version first, then delete original (avoids data loss if save fails)
+                calendar.save_event(new_ical)
+                event.delete()
+                recreated += 1
+                print(f"    Re-created as PUBLIC.")
+            except Exception as e:
+                errors += 1
+                print(f"    Error re-creating '{summary}': {type(e).__name__}: {e}", file=sys.stderr)
+
+    print(f"\nDone. Modified: {modified}, Re-created: {recreated}, Errors: {errors}")
     if errors:
         sys.exit(1)
 
@@ -308,17 +406,19 @@ def run(args):
 
     if mode == "dedup":
         run_dedup(events, calendar, args)
+    elif mode == "make-public":
+        run_make_public(events, calendar, args)
     else:
         run_purge(events, calendar, args)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Purge or deduplicate events in a CalDAV calendar.")
+    parser = argparse.ArgumentParser(description="Purge, deduplicate, or make public events in a CalDAV calendar.")
     parser.add_argument("--url", help="CalDAV server URL (env: CALDAV_URL)")
     parser.add_argument("--username", help="Username (env: CALDAV_USERNAME)")
     parser.add_argument("--principal-path", help="Principal path to skip discovery (e.g. /principals/users/8/)")
     parser.add_argument("--calendar", help="Calendar name (otherwise interactive picker)")
-    parser.add_argument("--mode", choices=["purge", "dedup"], help="Action: purge (delete all) or dedup (remove duplicates)")
+    parser.add_argument("--mode", choices=["purge", "dedup", "make-public"], help="Action: purge (delete all), dedup (remove duplicates), or make-public (set CLASS to PUBLIC)")
     parser.add_argument("--dry-run", action="store_true", help="List events without deleting")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt(s)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging (shows HTTP requests)")

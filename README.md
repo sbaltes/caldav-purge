@@ -1,8 +1,14 @@
 # caldav-utils
 
-Purge or deduplicate events in a CalDAV calendar.
+Purge, deduplicate, or make public events in a CalDAV calendar.
 
 Works with any CalDAV server (Mailbox.org, Nextcloud, Fastmail, iCloud, etc.).
+
+## How make-public works
+
+Events with `CLASS:PRIVATE` or `CLASS:CONFIDENTIAL` are set to `CLASS:PUBLIC`. Events without a `CLASS` property (which default to public per RFC 5545) or already set to `PUBLIC` are left unchanged.
+
+If the server rejects the modification with `Forbidden` (e.g. for events owned by another user on a shared calendar), the script offers to delete and re-create each affected event as `PUBLIC` with a new UID. The new event is saved first, and the original is only deleted after the save succeeds, to avoid data loss. Note that re-creation makes you the organizer of the event.
 
 ## How dedup works
 
@@ -24,7 +30,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```
-python caldav_utils.py [--url URL] [--username USERNAME] [--principal-path PATH] [--calendar CALENDAR] [--mode purge|dedup] [--dry-run] [--yes] [--debug]
+python caldav_utils.py [--url URL] [--username USERNAME] [--principal-path PATH] [--calendar CALENDAR] [--mode purge|dedup|make-public] [--dry-run] [--yes] [--debug]
 ```
 
 Any missing credentials are prompted interactively. After connecting and selecting a calendar, the script asks which action to perform:
@@ -45,7 +51,8 @@ Selected calendar: Personal
 Action:
   1. Deduplicate (remove duplicate events)
   2. Purge (delete ALL events)
-Select action [1-2]:
+  3. Make public (set all events to PUBLIC)
+Select action [1-3]:
 ```
 
 Use `--mode` to skip the action prompt:
@@ -53,6 +60,7 @@ Use `--mode` to skip the action prompt:
 ```sh
 python caldav_utils.py --mode dedup --calendar Personal --dry-run
 python caldav_utils.py --mode purge --calendar Personal --yes
+python caldav_utils.py --mode make-public --calendar Personal --dry-run
 ```
 
 ### Options
@@ -63,7 +71,7 @@ python caldav_utils.py --mode purge --calendar Personal --yes
 | `--username` | Username (fallback: `CALDAV_USERNAME` env var, then prompt) |
 | `--principal-path` | Principal path to skip auto-discovery (e.g. `/principals/users/8/`) |
 | `--calendar` | Calendar name — case-insensitive (fallback: interactive picker) |
-| `--mode` | `purge` (delete all) or `dedup` (remove duplicates) — fallback: interactive prompt |
+| `--mode` | `purge` (delete all), `dedup` (remove duplicates), or `make-public` (set CLASS to PUBLIC) — fallback: interactive prompt |
 | `--dry-run` | List events without deleting |
 | `--yes`, `-y` | Skip confirmation prompt(s) |
 | `--debug` | Enable debug logging (shows HTTP requests) |
@@ -112,6 +120,21 @@ Dry run — listing events:
   - Flight to Berlin
 
 3 event(s) would be deleted.
+```
+
+Preview which events would be made public:
+
+```
+$ python caldav_utils.py --mode make-public --calendar Personal --dry-run
+Fetching events ...
+Found 45 event(s).
+
+Found 2 non-public event(s):
+
+  - [PRIVATE] Dentist appointment
+  - [CONFIDENTIAL] Salary review
+
+Dry run — 2 event(s) would be set to PUBLIC.
 ```
 
 ### Troubleshooting
